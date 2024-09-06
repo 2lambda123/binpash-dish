@@ -9,10 +9,12 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
-	pb "dspash/datastream"
+	pb "runtime/pipe/proto"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -24,6 +26,7 @@ var (
 	streamId   = flag.String("id", "", "The id of the stream")
 	debug      = flag.Bool("d", false, "Turn on debugging messages")
 	chunkSize  = flag.Int("chunk_size", 4*1024, "The chunk size for the rpc stream")
+	killTarget = flag.String("kill", "", "Kill the node at the given address")
 )
 
 func getAddr(client pb.DiscoveryClient, timeout time.Duration) (string, error) {
@@ -56,6 +59,17 @@ func removeAddr(client pb.DiscoveryClient) {
 	log.Printf("Remove id %v returned %v", *streamId, err)
 }
 
+func poisonPill() {
+	log.Println("Received poison pill")
+	ex, _ := os.Executable()
+	exPath := filepath.Dir(ex)
+	scriptPath := filepath.Join(exPath, "../scripts/killall.sh")
+	err := exec.Command("bash", scriptPath).Start()
+	if err != nil {
+		log.Println("Error running killall script", err)
+	}
+}
+
 func read(client pb.DiscoveryClient) (int, error) {
 	timeout := 10 * time.Second
 	addr, err := getAddr(client, timeout)
@@ -71,9 +85,35 @@ func read(client pb.DiscoveryClient) (int, error) {
 	log.Printf("successfuly dialed to %v\n", addr)
 
 	reader := bufio.NewReader(conn)
-	n, err := reader.WriteTo(os.Stdout)
+	// n, err := reader.WriteTo(os.Stdout)
 
-	return int(n), err
+	chunkSize64 := int64(*chunkSize)
+	var total int64 = 0
+
+	for {
+		n, err := io.CopyN(os.Stdout, reader, chunkSize64)
+		total += n
+		if err != nil {
+			break
+		}
+
+		b, err := reader.ReadByte()
+		if err != nil {
+			break
+		}
+		total++
+
+		if b == 1 {
+			poisonPill()
+			break
+		}
+	}
+
+	if err == io.EOF {
+		err = nil
+	}
+
+	return int(total), err
 }
 
 func write(client pb.DiscoveryClient) (int, error) {
@@ -103,14 +143,49 @@ func write(client pb.DiscoveryClient) (int, error) {
 		return 0, err
 	}
 	defer conn.Close()
-	log.Println("accepted a connection")
+	log.Println("accepted a connection", conn.RemoteAddr())
 
 	writer := bufio.NewWriter(conn)
 	defer writer.Flush()
 
-	n, err := writer.ReadFrom(os.Stdin)
+	chunkSize64 := int64(*chunkSize)
+	var total int64 = 0
 
-	return int(n), err
+	isKillTarget := *killTarget == strings.Split(conn.RemoteAddr().String(), ":")[0]
+	// shouldSuicide := *killTarget == strings.Split(conn.LocalAddr().String(), ":")[0]
+
+	for {
+		n, err := io.CopyN(writer, os.Stdin, chunkSize64)
+		total += n
+		if err != nil {
+			break
+		}
+
+		// if shouldSuicide {
+		// 	log.Println("Swallowing poison pill")
+		// 	poisonPill()
+		// 	err = writer.WriteByte(0)
+		// }
+
+		if isKillTarget {
+			log.Println("Sending poison pill to", *killTarget)
+			err = writer.WriteByte(1)
+		} else {
+			err = writer.WriteByte(0)
+		}
+
+		if err != nil {
+			break
+		}
+		total++
+	}
+
+	if err == io.EOF {
+		err = nil
+	}
+
+	// n, err := writer.ReadFrom(os.Stdin)
+	return int(total), err
 }
 
 // TODO: readStream/writeStream are buggy but also not used so low priority.
@@ -140,8 +215,6 @@ func readStream(client pb.DiscoveryClient) (n int, err error) {
 		nn, err := writer.Write(reply.Buffer)
 		n += nn
 	}
-
-	return
 }
 
 func writeStream(client pb.DiscoveryClient) (n int, err error) {
@@ -171,6 +244,14 @@ func writeStream(client pb.DiscoveryClient) (n int, err error) {
 	}
 }
 
+func logFlagValues() {
+	var flags string
+	flag.VisitAll(func(f *flag.Flag) {
+		flags += fmt.Sprintf(" %s", f.Value.String())
+	})
+	log.Printf("Flag values:%s\n", flags)
+}
+
 func main() {
 	flag.Parse()
 	arg_idx := 0
@@ -190,6 +271,8 @@ func main() {
 		log.SetFlags(log.Flags() | log.Lmsgprefix)
 		log.SetPrefix(fmt.Sprintf("%v %v client ", (*streamId)[0:8], *streamType))
 	}
+
+	logFlagValues()
 
 	var opts []grpc.DialOption
 	opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))

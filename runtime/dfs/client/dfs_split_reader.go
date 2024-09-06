@@ -10,15 +10,15 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	pb "dspash/filereader"
+	pb "runtime/dfs/proto"
 )
 
 var (
-	config     = flag.String("config", "", "File to read")
 	splitNum   = flag.Int("split", 0, "The logical split number")
 	serverPort = flag.Int("port", 50051, "The server port, all machines should use same port")
 )
@@ -44,10 +44,11 @@ func readFirstLine(block DFSBlock, writer *bufio.Writer) (ok bool, e error) {
 	ok = false
 	e = errors.New("Failed to read newline from all replicas")
 	for _, host := range block.Hosts {
-		addr := fmt.Sprintf("%s:%d", host, *serverPort)
+		addr := fmt.Sprintf("%s:%d", strings.Split(host, ":")[0], *serverPort)
 		conn, err := grpc.Dial(addr, opts...)
 
 		if err != nil {
+			log.Println("Failed to connect to ", addr, err)
 			continue // try next addr
 		}
 		defer conn.Close()
@@ -56,6 +57,7 @@ func readFirstLine(block DFSBlock, writer *bufio.Writer) (ok bool, e error) {
 
 		stream, err := client.ReadFile(ctx, &pb.FileRequest{Path: block.Path})
 		if err != nil {
+			log.Println("Failed to read file from ", addr, err)
 			continue
 		}
 
@@ -145,9 +147,9 @@ func readDFSLogicalSplit(conf DFSConfig, split int) error {
 
 }
 
-func serialize_conf(p string) DFSConfig {
+func serialize_conf() DFSConfig {
 	conf := DFSConfig{}
-	byt, err := os.ReadFile(p)
+	byt, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -159,14 +161,9 @@ func serialize_conf(p string) DFSConfig {
 
 func main() {
 	flag.Parse()
-	if flag.NArg() < 1 && *config == "" {
-		flag.Usage()
-		os.Exit(0)
-	} else if *config == "" {
-		*config = flag.Arg(0)
-	}
+	log.Println("Starting dfs_split_reader client", *splitNum, *serverPort)
 
-	conf := serialize_conf(*config)
+	conf := serialize_conf()
 	err := readDFSLogicalSplit(conf, *splitNum)
 	if err != nil {
 		log.Fatalln(err)
